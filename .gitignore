@@ -1,18 +1,7 @@
-trash
-rejection_sampling/shards
-rejection_sampling/shards1
-token_length.png
-*.tfevents.*
-taskfile.yaml
-notebooks/
-
-oe-eval-internal/
-
 results
 wandb
 data/*
 checkpoints
-# !data/processed
 output/
 configs/beaker_configs/auto_created
 runs/
@@ -151,19 +140,7 @@ dmypy.json
 .vscode
 .DS_Store
 
-# Ignore submitit logs
-submitit_logs/
-
-# Ignore hydra logs
-outputs/
-results/
-
-# Ignore personal scratch
-zscratch/ignore
-
 # Ignore slurm submit jobs and error outs
-submit.sh
-flush.sh
 err/
 out/
 image/datasets/
