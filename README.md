@@ -9,7 +9,7 @@ Dayal Singh Kalra, Jean-Christophe Gagnon-Audet, Andrey Gromov, Ishita Mediratta
 
 ## Overview
 
-We introduce *critical sharpness*, a measure of loss landscape curvature that can be computed using forward passes alone. This makes it tractable for large models where Hessian-based methods are infeasible. The method requires approximately 5-6 forward passes given an update direction.
+We analyze *critical sharpness*, a measure of loss landscape curvature that can be computed using forward passes alone. This makes it tractable for large models where Hessian-based methods are infeasible. The method requires approximately 5-6 forward passes given an update direction.
 
 ## Installation
 
