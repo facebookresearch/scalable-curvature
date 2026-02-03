@@ -442,8 +442,8 @@ parser.add_argument('--warmup_exponent', type = float, default = 1.0)
 parser.add_argument('--stable_steps', type = int, default = 6000)
 parser.add_argument('--decay_schedule_name', type = str, default = 'polynomial') # 'cosine' or 'polynomial'
 parser.add_argument('--decay_exponent', type = float, default = 1.0)
-parser.add_argument('--gradient_accumulation_steps', type = int, default = 16)
-parser.add_argument('--batch_size', type = int, default = 64)
+parser.add_argument('--gradient_accumulation_steps', type = int, default = 64)
+parser.add_argument('--batch_size', type = int, default = 16)
 parser.add_argument('--grad_clip', type = float, default = 1.0)
 parser.add_argument('--tol_power', type = int, default = 4)
 ### evaluation
