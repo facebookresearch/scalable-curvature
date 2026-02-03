@@ -9,89 +9,293 @@ Dayal Singh Kalra, Jean-Christophe Gagnon-Audet, Andrey Gromov, Ishita Mediratta
 
 ## Overview
 
-We analyze *critical sharpness*, a measure of loss landscape curvature that can be computed using forward passes alone. This makes it tractable for large models where Hessian-based methods are infeasible. The method requires approximately 5-6 forward passes given an update direction.
+We analyze **critical sharpness** (λc), a computationally efficient measure of loss landscape curvature requiring fewer than 10 forward passes given the update direction. Critical sharpness is defined as λc = 2/ηc, where ηc is the **critical learning rate** — the smallest learning rate that causes the training loss to increase in the next training step.
+
+**Why critical sharpness?**
+
+Despite its significance in analyzing training dynamics, direct measurement of Hessian sharpness (the largest eigenvalue of the loss Hessian) remains prohibitive for Large Language Models (LLMs) due to high computational cost. Critical sharpness provides a scalable alternative that:
+
+- Requires only **5-6 forward passes** per measurement (given the update direction)
+- Uses **exponential search followed by binary search** to find the critical learning rate
+- Captures well-documented Hessian sharpness phenomena, including **progressive sharpening** and **Edge of Stability**
+- Works with modern distributed training (DDP/FSDP) — relies solely on forward passes, avoiding the challenges of Hessian-based methods
+
+This repository demonstrates how to measure critical sharpness using an adapted version of [nanoGPT](https://github.com/karpathy/nanoGPT) by Andrej Karpathy.
 
 ## Installation
 
 ```bash
 conda create -n curvature python=3.10
 conda activate curvature
-pip install torch numpy pandas scipy wandb
-pip install cupy-cuda12x  # adjust for your CUDA version -- needed for HVP computation
+
+pip install torch numpy pandas scipy wandb tqdm transformers tiktoken datasets
 ```
 
 ## Data
 
-**CIFAR-10**: Downloaded automatically via torchvision.
-
-**FineWeb**: Follow the [nanoGPT](https://github.com/karpathy/nanoGPT) data preparation instructions to tokenize FineWeb-Edu into `language/data/fineweb/`.
-
-## Reproducing Results
-
-### Figure 2: CIFAR-10 Sharpness Dynamics (SGD)
-
-FCN with 4 layers, width 512, trained with SGD at constant learning rate 3e-02.
+**FineWeb**: Tokenize FineWeb-Edu into `data/fineweb/`. The `prepare.py` script follows the [nanoGPT](https://github.com/karpathy/nanoGPT) pipeline exactly.
 
 ```bash
-cd image
-
-# Full batch (batch_size=50000)
-python train_fcn_image_sgd_dir_sharp.py \
-    --batch_size 50000 --lr_peak 3e-02 --num_steps 10000 \
-    --warmup_steps 0 --stable_steps 10000 --loss_name xent
-
-# Batch size 5000
-python train_fcn_image_sgd_dir_sharp.py \
-    --batch_size 5000 --lr_peak 3e-02 --num_steps 10000 \
-    --warmup_steps 0 --stable_steps 10000 --loss_name xent
-
-# Batch size 500
-python train_fcn_image_sgd_dir_sharp.py \
-    --batch_size 500 --lr_peak 3e-02 --num_steps 10000 \
-    --warmup_steps 0 --stable_steps 10000 --loss_name xent
+cd data/fineweb
+python prepare.py
 ```
 
-### Figure 3: GPT Pre-training Sharpness Dynamics (AdamW)
+## Quick Start
 
-GPT with 12 layers, 768 embedding dim, trained on FineWeb with WSD schedule.
+Run the demo training script (adapted from [nanoGPT](https://github.com/karpathy/nanoGPT)):
 
 ```bash
-cd language
-
-python train_gpt_adam_dir_sharp.py \
-    --num_layers 12 --num_heads 12 --head_dim 64 \
-    --lr_peak 3e-04 --num_steps 10000 \
-    --warmup_steps 2000 --stable_steps 6000 \
-    --batch_size 16 --gradient_accumulation_steps 64 \
-    --weight_decay 0.0
+python demo_nanogpt.py
 ```
 
-## Configuration
+This will train a GPT model while logging critical sharpness metrics to Weights & Biases.
 
-Before running on your cluster, update the following:
+## Integration Guide
 
-- **SLURM settings**: Edit `MY_ACCT` and `MY_QOS` in `image/submit_job.sh` and `language/submit_job.sh` (and the corresponding `write_*_submit_job.sh` scripts) to match your cluster's account and QOS.
-- **Checkpoint paths**: The `--ckpt_dir` argument defaults to `./checkpoints`. Modify as needed for your storage setup.
+**Important:** This measurement function requires custom optimizers from `utils.optimizers` that implement a `_compute_update()` method for virtual stepping. Standard PyTorch optimizers (`torch.optim.AdamW`, `torch.optim.SGD`) will not work.
+
+### Why Custom Optimizers?
+
+The measurement function needs to compute "virtual" parameter updates without actually modifying the model weights or optimizer state. This requires a `_compute_update()` method that our custom optimizers provide but standard PyTorch optimizers do not.
+
+### Step-by-Step Integration
+
+#### 1. Import Required Components
+
+```python
+from utils.measure_critical_lr import measure_critical_lr
+from utils.optimizers import AdamW  # MUST use this, not torch.optim.AdamW
+```
+
+#### 2. Initialize Custom Optimizer
+
+```python
+# Use custom optimizer instead of torch.optim
+optimizer = AdamW(
+    model.parameters(),
+    lr=learning_rate,
+    betas=(0.9, 0.999),
+    weight_decay=0.01
+)
+```
+
+#### 3. Define Loss Closure
+
+The measurement function requires a **loss closure** that takes a batch and returns a scalar loss. This closure should include:
+- Forward pass through the model
+- Loss computation
+- Any distributed training synchronization (e.g., DDP/FSDP all-reduce operations)
+
+```python
+def loss_closure(batch):
+    """Compute loss for a given batch.
+    
+    This closure is called multiple times during the search process.
+    It should include all forward pass operations and distributed 
+    training synchronization needed to compute the loss.
+    """
+    inputs, targets = batch
+    
+    # Forward pass
+    logits = model(inputs)
+    
+    # Compute loss
+    loss = F.cross_entropy(
+        logits.view(-1, logits.size(-1)),
+        targets.view(-1)
+    )
+    
+    # For DDP/FSDP: synchronization happens automatically in forward pass
+    
+    return loss.item()  # Return scalar, not tensor
+```
+
+#### 4. Integrate into Training Loop
+
+Place the measurement call **after** `loss.backward()` but **before** `optimizer.step()`:
+
+```python
+# Initialize lr_guess before training loop
+current_lr_guess = 1e-3
+
+for batch in dataloader:
+    inputs, targets = batch
+    
+    # 1. Forward pass and backward pass
+    logits = model(inputs)
+    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+    loss.backward()
+    
+    # Optional: gradient clipping
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    
+    # 2. Measure critical sharpness (uses gradients from backward pass)
+    lr_lower, lr_upper, n_probes = measure_critical_lr(
+        model=model,
+        optimizer=optimizer,
+        batch=(inputs, targets),
+        loss_closure=loss_closure,
+        lr_guess=current_lr_guess,  # Use updated guess from previous iteration
+        tol_power=4
+    )
+    
+    # The critical sharpness is typically logged as the average
+    critical_lr = (lr_lower + lr_upper) / 2.0
+    critical_sharpness = 2.0 / critical_lr
+    
+    # Update lr_guess for next iteration (reduces exponential search steps)
+    current_lr_guess = critical_lr
+    
+    # 3. Log metrics
+    wandb.log({
+        "loss": loss.item(),
+        "critical_lr": critical_lr,
+        "critical_sharpness": critical_sharpness,
+        "lr_lower": lr_lower,
+        "lr_upper": lr_upper,
+        "n_probes": n_probes
+    })
+    
+    # 4. Optimizer step
+    optimizer.step()
+    optimizer.zero_grad()
+```
+
+### Function Reference
+
+```python
+lr_lower, lr_upper, n_probes = measure_critical_lr(
+    model,           # nn.Module
+    optimizer,       # Custom optimizer (AdamW or SGD from utils.optimizers)
+    batch,           # Batch data (e.g., tuple of (inputs, targets))
+    loss_closure,    # Callable that takes batch and returns scalar loss
+    lr_guess=1e-3,   # Initial guess for exponential search (update with previous critical_lr)
+    tol_power=4,     # Search precision: tolerance = 1 / 2^tol_power
+    logger=None      # Optional logger for debug output
+)
+```
+
+**Returns:**
+- `lr_lower` (float): Lower bound of critical learning rate
+- `lr_upper` (float): Upper bound of critical learning rate  
+- `n_probes` (int): Number of forward passes used in the search
+
+**Critical sharpness** is typically computed as the average: `(lr_lower + lr_upper) / 2.0`
+
+**Note:** For best efficiency, update `lr_guess` with the previous iteration's critical LR to minimize exponential search steps.
+
+### How It Works
+
+The measurement uses a two-phase search algorithm:
+
+1. **Exponential Search**: Starting from `lr_guess`, exponentially increase or decrease the learning rate until we bracket the critical point (where a single step would increase the loss).
+
+2. **Binary Search**: Refine the bracket using binary search until the relative gap is less than `1 / 2^tol_power` (default: 1/16 = 6.25%).
+
+Each probe involves:
+- Computing virtual parameter updates at a candidate learning rate (without modifying the model)
+- Temporarily applying these updates
+- Evaluating the loss
+- Restoring the original parameters
+
+## Complete Working Example
+
+Here's a minimal end-to-end example:
+
+```python
+import torch
+import torch.nn.functional as F
+from utils.measure_critical_lr import measure_critical_lr
+from utils.optimizers import AdamW  # Custom optimizer
+
+# Model and data
+model = MyModel()
+dataloader = MyDataLoader()
+
+# MUST use custom optimizer
+optimizer = AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
+
+# Define loss closure
+def loss_closure(batch):
+    inputs, targets = batch
+    logits = model(inputs)
+    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+    return loss.item()
+
+# Initialize lr_guess
+current_lr_guess = 1e-3
+
+# Training loop
+for batch in dataloader:
+    inputs, targets = batch
+    
+    # Forward & backward
+    logits = model(inputs)
+    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+    loss.backward()
+    
+    # Measure critical sharpness
+    lr_lower, lr_upper, n_probes = measure_critical_lr(
+        model=model,
+        optimizer=optimizer,
+        batch=(inputs, targets),
+        loss_closure=loss_closure,
+        lr_guess=current_lr_guess
+    )
+    
+    critical_lr = (lr_lower + lr_upper) / 2.0
+    critical_sharpness = 2.0 / critical_lr
+    
+    # Update guess for next iteration
+    current_lr_guess = critical_lr
+    
+    print(f"Loss: {loss.item():.4f}, Critical Sharpness: {critical_sharpness:.4f}")
+    
+    # Update weights
+    optimizer.step()
+    optimizer.zero_grad()
+```
 
 ## Code Structure
 
-```
+```text
 scalable-curvature/
-├── image/                          # CIFAR-10 experiments
-│   ├── train_fcn_image_sgd_dir_sharp.py
-│   ├── train_fcn_image_adamw_dir_sharp.py
-│   └── utils/
-│       ├── critical_lr_cache_utils.py   # Critical LR estimation
-│       ├── sharpness_dir_utils.py       # Directional sharpness (HVP-based)
-│       ├── sharpness_cupy_utils.py      # Hessian sharpness (LOBPCG)
-│       └── optimizers.py                # Custom SGD/AdamW with virtual_step
-└── language/                       # GPT experiments
-    ├── train_gpt_adam_dir_sharp.py
-    └── utils/
-        ├── critical_learning_rate.py
-        ├── gpt.py
-        └── ...
+├── demo_nanogpt.py           # Training demo (adapted from nanoGPT by Andrej Karpathy)
+├── data/
+│   └── fineweb/              # Data preparation
+│       ├── prepare.py
+│       ├── train.bin
+│       └── val.bin
+└── utils/
+    ├── measure_critical_lr.py   # Critical sharpness measurement (exponential + binary search)
+    ├── optimizers.py            # Custom optimizers with virtual_step support (REQUIRED)
+    ├── gpt_sp.py                # GPT model definition
+    ├── schedules_utils.py       # Learning rate schedules
+    ├── data_loader.py           # Data loading utilities
+    ├── data_storage.py          # Logging utilities
+    └── loss_functions.py        # Loss function definitions
 ```
+
+## Distributed Training Notes
+
+The measurement function is compatible with DDP and FSDP:
+
+- **DDP**: Gradient synchronization happens during `loss.backward()`. The measurement uses these synchronized gradients.
+- **FSDP**: Forward pass automatically handles parameter gathering. Make sure your `loss_closure` includes the forward pass so parameters are gathered correctly during probing.
+
+## Troubleshooting
+
+**Error: `AttributeError: 'AdamW' object has no attribute '_compute_update'`**
+- You're using `torch.optim.AdamW` instead of `utils.optimizers.AdamW`
+- Solution: Import and use the custom optimizer from `utils.optimizers`
+
+**High number of probes (>20)**
+- The `lr_guess` might be far from the true critical learning rate
+- Solution: Adjust `lr_guess` to be closer to your actual training learning rate
+
+**Loss closure returns tensor instead of scalar**
+- The `loss_closure` should return `loss.item()`, not the tensor
+- Solution: Add `.item()` to convert tensor to Python float
 
 ## Citation
 
@@ -103,3 +307,7 @@ scalable-curvature/
   year={2026}
 }
 ```
+
+## Acknowledgements
+
+The GPT pre-training demo (`demo_nanogpt.py`) and data pipeline in this repository are adapted from [nanoGPT](https://github.com/karpathy/nanoGPT) by Andrej Karpathy.

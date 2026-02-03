@@ -1,9 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
 """
 Full definition of a GPT Language Model, all of it in this single file.
 References:
@@ -14,6 +8,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 """
 
 import math
+import inspect
 from dataclasses import dataclass
 
 import torch
@@ -25,11 +20,11 @@ class LayerNorm(nn.Module):
 
     def __init__(self, ndim, bias):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
+        self.scale = nn.Parameter(torch.ones(ndim))
         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
 
     def forward(self, x):
-        return F.layer_norm(x, self.weight.shape, weight = self.weight, bias = self.bias, eps = 1e-5)
+        return F.layer_norm(x, self.scale.shape, weight = self.scale, bias = self.bias, eps = 1e-5)
 
 class CausalSelfAttention(nn.Module):
 
@@ -51,11 +46,11 @@ class CausalSelfAttention(nn.Module):
         
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = config.use_flash and hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.context_len, config.context_len))
-                                        .view(1, 1, config.context_len, config.context_len))
+            self.register_buffer("bias", torch.tril(torch.ones(config.context_len, config.context_len)).view(1, 1, config.context_len, config.context_len))
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (embd_dim)
@@ -65,21 +60,27 @@ class CausalSelfAttention(nn.Module):
         q = self.q_proj(x)
         v = self.v_proj(x)
 
-        k = k.view(B, T, self.num_heads, C // self.num_heads).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.num_heads, C // self.num_heads).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.num_heads, C // self.num_heads).transpose(1, 2) # (B, nh, T, hs)
+        k = k.view(B, T, self.num_heads, C // self.num_heads).transpose(1, 2) # (batch_size, num_heads, context_len, head_dim)
+        q = q.view(B, T, self.num_heads, C // self.num_heads).transpose(1, 2) # (batch_size, num_heads, context_len, head_dim)
+        v = v.view(B, T, self.num_heads, C // self.num_heads).transpose(1, 2) # (batch_size, num_heads, context_len, head_dim)
+
+        # 1/sqrt(d) scaling
+        attention_scale = 1.0 / math.sqrt(k.size(-1))
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask = None, is_causal = True, scale = attention_scale)
         else:
             # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = (q @ k.transpose(-2, -1)) * attention_scale
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
+            att = F.softmax(att, dim = -1)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+        # re-assemble all head outputs side by side
+        # transpose -> (B, T, nh, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) 
 
         # output projection
         y = self.output_proj(y)
@@ -104,14 +105,14 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.embd_dim, bias = config.bias)
+        self.attn_norm = LayerNorm(config.embd_dim, bias = config.bias)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.embd_dim, bias = config.bias)
+        self.mlp_norm = LayerNorm(config.embd_dim, bias = config.bias)
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        x = x + self.attn(self.attn_norm(x))
+        x = x + self.mlp(self.mlp_norm(x))
         return x
 
 @dataclass
@@ -122,9 +123,9 @@ class GPTConfig:
     num_heads: int = 12
     embd_dim: int = 768
     bias: bool = False
-    init_var: float = 1.0 # not used
+    init_var: float = 1.0
     use_flash: bool = False
-
+    
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -136,29 +137,38 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.embd_dim),
             wpe = nn.Embedding(config.context_len, config.embd_dim),
-            h = nn.ModuleList([Block(config) for _ in range(config.num_layers)]),
-            ln_f = LayerNorm(config.embd_dim, bias = config.bias),
+            blocks = nn.ModuleList([Block(config) for _ in range(config.num_layers)]),
+            final_norm = LayerNorm(config.embd_dim, bias = config.bias),
         ))
+
+        # no weight tying
         self.lm_head = nn.Linear(config.embd_dim, config.vocab_size, bias = False)
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
-        # init all weights
-        self.apply(self._init_weights)
-        # apply special scaled init to the residual projections, per GPT-2 paper
-        for name, p in self.named_parameters():
-            if 'output_proj.weight' in name or 'mlp_proj.weight' in name:
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.num_layers))
+        ### NOTE: initialization code edit start
+        for name, param in self.named_parameters():
+            # Embedding layers
+            if 'wte.weight' in name or 'wpe.weight' in name:
+                torch.nn.init.normal_(param, mean = 0.0, std = math.sqrt(self.config.init_var))
+            # last layer
+            elif 'lm_head.weight' in name:
+                torch.nn.init.normal_(param, mean = 0.0, std = math.sqrt(self.config.init_var) / math.sqrt(self.config.embd_dim))
+            # Special projection layers
+            elif 'output_proj.weight' in name or 'mlp_proj.weight' in name:
+                torch.nn.init.normal_(param, mean = 0.0, std = math.sqrt(self.config.init_var) / math.sqrt(2 * self.config.num_layers * self.config.embd_dim))
+                # torch.nn.init.normal_(param, mean = 0.0, std = math.sqrt(self.config.init_var) / math.sqrt(self.config.embd_dim))
+            # Regular weights
+            elif 'weight' in name:
+                torch.nn.init.normal_(param, mean = 0.0, std = math.sqrt(self.config.init_var) / math.sqrt(self.config.embd_dim))
+            # All biases initialized to zero
+            elif 'bias' in name:
+                torch.nn.init.zeros_(param)
+        ### initialization code edit end
 
+        # report number of parameters
+        # print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
     
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def get_num_params(self, non_embedding=True):
+    
+    def get_num_params(self):
         """
         Return the number of parameters in the model.
         For non-embedding count (default), the position embeddings get subtracted.
@@ -166,10 +176,10 @@ class GPT(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        return n_params, self.transformer.wte.weight.numel()
+        return n_params, self.transformer.wte.weight.numel() + self.lm_head.weight.numel()
 
     
-    def forward(self, idx, targets=None):
+    def forward(self, idx):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.context_len, f"Cannot forward sequence of length {t}, block size is only {self.config.context_len}"
@@ -178,36 +188,70 @@ class GPT(nn.Module):
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, embd_dim)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, embd_dim)
-        x = tok_emb + pos_emb
-        for block in self.transformer.h:
+        x = (tok_emb + pos_emb) / math.sqrt(2)
+
+        for i, block in enumerate(self.transformer.blocks):
             x = block(x)
-        x = self.transformer.ln_f(x)
+        x = self.transformer.final_norm(x)
 
         logits = self.lm_head(x)
+        
         return logits
     
-    def configure_optimizers(self, learning_rate, betas, eps, weight_decay, device_type):
-        # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+    def AdamW(self, learning_rate, betas, eps, weight_decay, device_type):
         
-        optimizer = torch.optim.AdamW(optim_groups, lr = learning_rate, betas = betas, eps = eps, weight_decay = weight_decay)
+        decay_params = []
+        nodecay_params = []
 
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+                    
+            if param.dim() >= 2:
+                decay_params.append(param)
+            else:
+                nodecay_params.append(param)
+            
+        optim_groups = [
+                {'params': decay_params, 'weight_decay': weight_decay * self.config.embd_dim, 'lr_scale': 1.0 / self.config.embd_dim},
+                {'params': nodecay_params, 'weight_decay': 0.0, 'lr_scale': 1.0 / self.config.embd_dim}
+        ]
+
+        optimizer = torch.optim.AdamW(optim_groups, lr = learning_rate, betas = betas, eps = eps, weight_decay = weight_decay)
+        
         return optimizer
 
+
+    def SGD(self, learning_rate, momentum, weight_decay, device_type):
+        
+        decay_params = []
+        nodecay_params = []
+
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+                    
+            if param.dim() >= 2:
+                # decay params for 2D tensors
+                decay_params.append(param)
+            else:
+                # ecxlude layernorms, biases; no weight decay
+                nodecay_params.append(param)
+            
+        optim_groups = [
+                {'params': decay_params, 'weight_decay': weight_decay},
+                {'params': nodecay_params, 'weight_decay': 0.0, 'lr_scale': 1.0}
+        ]
+                
+        # # Create AdamW optimizer and use the fused version if it is available
+        # fused_available = 'fused' in inspect.signature(torch.optim.SGD).parameters
+        # use_fused = fused_available and device_type == 'cuda'
+        # extra_args = dict(fused = True) if use_fused else dict()
+
+        optimizer = torch.optim.SGD(optim_groups, lr = learning_rate, momentum = momentum, weight_decay = weight_decay)
+
+        # print(f'Using fused AdamW: {use_fused}')
+        return optimizer
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
