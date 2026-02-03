@@ -149,3 +149,7 @@ language/err/
 language/out/
 language/gpt_results/
 language/data/
+
+data/fineweb/train.bin
+data/fineweb/val.bin
+data/fineweb/submit_job.sh
